@@ -197,6 +197,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Stripe payment intent for one-time purchases
   app.post("/api/create-payment-intent", authenticateToken, async (req: any, res) => {
     try {
+      if (!stripe) {
+        return res.status(503).json({ error: "Payment processing is not available - Stripe not configured" });
+      }
+
       const { planId, discountCode } = req.body;
       
       const plans = await storage.getSubscriptionPlans();
@@ -212,7 +216,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Apply discount if code provided
       if (discountCode) {
         employee = await storage.getEmployeeByDiscountCode(discountCode);
-        if (employee && employee.isActive) {
+        if (employee && employee.isActive && employee.discountPercentage) {
           discountAmount = finalPrice * (employee.discountPercentage / 100);
           finalPrice -= discountAmount;
         }
@@ -269,7 +273,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Create commission record if discount code was used
         if (discountCode) {
           const employee = await storage.getEmployeeByDiscountCode(discountCode);
-          if (employee) {
+          if (employee && employee.commissionRate) {
             const commissionAmount = parseFloat(finalPrice) * parseFloat(employee.commissionRate);
             await storage.createCommissionRecord({
               employeeId: employee.id,
@@ -282,8 +286,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
             });
 
             // Update employee totals
-            const newTotalCommission = parseFloat(employee.totalCommission) + commissionAmount;
-            const newTotalPoints = employee.totalPoints + 1;
+            const currentTotalCommission = employee.totalCommission ? parseFloat(employee.totalCommission) : 0;
+            const currentTotalPoints = employee.totalPoints || 0;
+            const newTotalCommission = currentTotalCommission + commissionAmount;
+            const newTotalPoints = currentTotalPoints + 1;
             await storage.updateEmployee(employee.id, {
               totalCommission: newTotalCommission.toString(),
               totalPoints: newTotalPoints
