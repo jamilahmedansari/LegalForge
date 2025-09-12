@@ -1,0 +1,2188 @@
+Let me provide you with a comprehensive implementation of your legal letter generation platform using Next.js and Supabase. This combination is indeed the best choice for your application because Supabase gives us authentication, real-time database, storage, and edge functions all in one platform, while Next.js provides excellent full-stack capabilities with API routes, server-side rendering, and a fantastic developer experience.
+
+I'll walk you through building this application step by step, explaining the architectural decisions and implementation details as we go. Think of this as constructing a building - we'll start with the foundation (database and authentication), then build up the walls (API routes and business logic), and finally add the finishing touches (UI components and user experience).
+
+<artifacts>
+<artifact id="legal-letter-platform" type="application/vnd.ant.code" language="typescript" title="Complete Legal Letter Generation Platform Implementation">
+// ============================================
+// PART 1: PROJECT STRUCTURE & INITIAL SETUP
+// ============================================
+
+/*
+First, let's establish our project structure. This organization helps maintain
+clean separation of concerns and makes the codebase maintainable as it grows.
+
+legal-letter-platform/
+├── app/                      # Next.js 14 app directory
+│   ├── (auth)/              # Authentication routes group
+│   │   ├── login/
+│   │   └── signup/
+│   ├── (user)/              # User portal routes
+│   │   ├── dashboard/
+│   │   ├── letters/
+│   │   └── subscription/
+│   ├── (employee)/          # Employee portal routes
+│   │   ├── dashboard/
+│   │   └── performance/
+│   ├── admin/               # Admin portal (separate route)
+│   │   ├── layout.tsx       # Admin-specific layout
+│   │   └── dashboard/
+│   ├── api/                 # API routes
+│   │   ├── letters/
+│   │   ├── subscriptions/
+│   │   └── webhooks/
+│   └── layout.tsx           # Root layout
+├── components/              # Reusable components
+├── lib/                     # Utilities and services
+│   ├── supabase/           # Supabase client and utilities
+│   ├── services/           # Business logic services
+│   └── hooks/              # Custom React hooks
+├── types/                   # TypeScript type definitions
+└── supabase/               # Supabase configuration
+    ├── migrations/         # Database migrations
+    └── functions/          # Edge functions
+*/
+
+// ============================================
+// PART 2: DATABASE SETUP (supabase/migrations/001_initial_schema.sql)
+// ============================================
+
+const databaseSchema = `
+-- Enable necessary extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Create custom types for better type safety
+CREATE TYPE user_type AS ENUM ('user', 'employee', 'admin');
+CREATE TYPE letter_status AS ENUM ('requested', 'reviewing', 'completed', 'downloaded');
+CREATE TYPE billing_cycle AS ENUM ('one-time', 'yearly');
+
+-- Main profiles table that extends Supabase Auth
+-- This is our central user table that connects to Supabase's auth.users
+CREATE TABLE profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  user_type user_type NOT NULL DEFAULT 'user',
+  full_name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  phone TEXT,
+  company_name TEXT, -- For law firms or businesses
+  address JSONB DEFAULT '{}', -- Flexible address storage
+  metadata JSONB DEFAULT '{}', -- Additional flexible data
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Employee-specific data with automatic discount code generation
+CREATE TABLE employees (
+  id UUID PRIMARY KEY REFERENCES profiles(id) ON DELETE CASCADE,
+  discount_code TEXT UNIQUE NOT NULL,
+  total_commission DECIMAL(10,2) DEFAULT 0.00,
+  total_points INTEGER DEFAULT 0,
+  commission_rate DECIMAL(4,3) DEFAULT 0.05, -- 5% as decimal
+  discount_percentage INTEGER DEFAULT 20,
+  is_active BOOLEAN DEFAULT true,
+  performance_tier TEXT DEFAULT 'bronze', -- For gamification
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Subscription plans configuration (managed by admin)
+CREATE TABLE subscription_plans (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name TEXT NOT NULL,
+  description TEXT,
+  letter_count INTEGER NOT NULL,
+  price DECIMAL(10,2) NOT NULL,
+  billing_cycle billing_cycle NOT NULL,
+  is_active BOOLEAN DEFAULT true,
+  features JSONB DEFAULT '[]', -- Array of feature strings
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Insert default subscription plans
+INSERT INTO subscription_plans (name, description, letter_count, price, billing_cycle, features) VALUES
+  ('Single Letter', 'One professional legal letter', 1, 299.00, 'one-time', '["AI-generated content", "Attorney review", "PDF download"]'),
+  ('Monthly Plan', 'Four letters per month', 48, 299.00, 'yearly', '["48 letters/year", "Priority review", "PDF downloads", "Email support"]'),
+  ('Premium Plan', 'Eight letters per month', 96, 599.00, 'yearly', '["96 letters/year", "Priority review", "PDF downloads", "Priority support", "Custom templates"]');
+
+-- User subscriptions with discount tracking
+CREATE TABLE user_subscriptions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  plan_id UUID NOT NULL REFERENCES subscription_plans(id),
+  stripe_subscription_id TEXT, -- For recurring subscriptions
+  stripe_customer_id TEXT,
+  discount_code_used TEXT REFERENCES employees(discount_code),
+  original_price DECIMAL(10,2) NOT NULL,
+  discount_amount DECIMAL(10,2) DEFAULT 0.00,
+  final_price DECIMAL(10,2) NOT NULL,
+  letters_remaining INTEGER NOT NULL,
+  letters_used INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'active' CHECK (status IN ('active', 'cancelled', 'expired')),
+  expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  cancelled_at TIMESTAMPTZ
+);
+
+-- Letters table with comprehensive tracking
+CREATE TABLE letters (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  subscription_id UUID REFERENCES user_subscriptions(id),
+  
+  -- Sender information
+  sender_name TEXT NOT NULL,
+  sender_address JSONB NOT NULL,
+  sender_firm_name TEXT,
+  
+  -- Recipient information
+  recipient_name TEXT NOT NULL,
+  recipient_address JSONB NOT NULL,
+  
+  -- Letter content
+  subject TEXT NOT NULL,
+  conflict_description TEXT NOT NULL,
+  desired_resolution TEXT NOT NULL,
+  additional_notes TEXT,
+  
+  -- AI and processing
+  ai_prompt TEXT, -- Store the prompt used for AI generation
+  ai_generated_content TEXT,
+  attorney_notes TEXT,
+  final_content TEXT, -- After attorney review
+  
+  -- Status tracking
+  status letter_status DEFAULT 'requested',
+  pdf_url TEXT,
+  
+  -- Timestamps for timeline
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  ai_generated_at TIMESTAMPTZ,
+  reviewed_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  downloaded_at TIMESTAMPTZ
+);
+
+-- Commission tracking with detailed records
+CREATE TABLE commission_records (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  employee_id UUID NOT NULL REFERENCES employees(id),
+  subscription_id UUID NOT NULL REFERENCES user_subscriptions(id),
+  commission_amount DECIMAL(10,2) NOT NULL,
+  points_earned INTEGER DEFAULT 1,
+  commission_rate DECIMAL(4,3) NOT NULL, -- Rate at time of sale
+  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'paid', 'cancelled')),
+  paid_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create indexes for performance
+CREATE INDEX idx_letters_user_id ON letters(user_id);
+CREATE INDEX idx_letters_status ON letters(status);
+CREATE INDEX idx_subscriptions_user_id ON user_subscriptions(user_id);
+CREATE INDEX idx_commission_employee_id ON commission_records(employee_id);
+CREATE INDEX idx_profiles_email ON profiles(email);
+CREATE INDEX idx_employees_discount_code ON employees(discount_code);
+
+-- Row Level Security Policies
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employees ENABLE ROW LEVEL SECURITY;
+ALTER TABLE letters ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE commission_records ENABLE ROW LEVEL SECURITY;
+
+-- Profiles policies: Users see their own, admins see all
+CREATE POLICY "Users can view own profile" ON profiles
+  FOR SELECT USING (auth.uid() = id);
+
+CREATE POLICY "Users can update own profile" ON profiles
+  FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Admins can view all profiles" ON profiles
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM profiles 
+      WHERE id = auth.uid() AND user_type = 'admin'
+    )
+  );
+
+-- Letters policies: Users see their own, admins see all
+CREATE POLICY "Users can view own letters" ON letters
+  FOR SELECT USING (user_id = auth.uid());
+
+CREATE POLICY "Users can create letters" ON letters
+  FOR INSERT WITH CHECK (
+    user_id = auth.uid() AND
+    EXISTS (
+      SELECT 1 FROM user_subscriptions
+      WHERE user_id = auth.uid()
+      AND status = 'active'
+      AND letters_remaining > 0
+    )
+  );
+
+CREATE POLICY "Admins can manage all letters" ON letters
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM profiles 
+      WHERE id = auth.uid() AND user_type = 'admin'
+    )
+  );
+
+-- Employee policies
+CREATE POLICY "Employees view own data" ON employees
+  FOR SELECT USING (id = auth.uid());
+
+CREATE POLICY "Employees view own commissions" ON commission_records
+  FOR SELECT USING (employee_id = auth.uid());
+
+-- Functions and Triggers
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_profiles_updated_at
+  BEFORE UPDATE ON profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at();
+`;
+
+// ============================================
+// PART 3: SUPABASE CLIENT SETUP (lib/supabase/client.ts)
+// ============================================
+
+// Client-side Supabase client
+import { createBrowserClient } from '@supabase/ssr'
+
+export function createClient() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+
+// ============================================
+// PART 4: SERVER-SIDE SUPABASE (lib/supabase/server.ts)
+// ============================================
+
+import { createServerClient, type CookieOptions } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+
+export async function createServerSupabaseClient() {
+  const cookieStore = cookies()
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return cookieStore.get(name)?.value
+        },
+        set(name: string, value: string, options: CookieOptions) {
+          cookieStore.set({ name, value, ...options })
+        },
+        remove(name: string, options: CookieOptions) {
+          cookieStore.set({ name, value: '', ...options })
+        },
+      },
+    }
+  )
+}
+
+// ============================================
+// PART 5: TYPE DEFINITIONS (types/index.ts)
+// ============================================
+
+export interface Profile {
+  id: string
+  user_type: 'user' | 'employee' | 'admin'
+  full_name: string
+  email: string
+  phone?: string
+  company_name?: string
+  address?: Address
+  created_at: string
+  updated_at: string
+}
+
+export interface Address {
+  street: string
+  city: string
+  state: string
+  zip: string
+  country: string
+}
+
+export interface Employee extends Profile {
+  discount_code: string
+  total_commission: number
+  total_points: number
+  commission_rate: number
+  discount_percentage: number
+  is_active: boolean
+  performance_tier: 'bronze' | 'silver' | 'gold' | 'platinum'
+}
+
+export interface Letter {
+  id: string
+  user_id: string
+  subscription_id: string
+  sender_name: string
+  sender_address: Address
+  sender_firm_name?: string
+  recipient_name: string
+  recipient_address: Address
+  subject: string
+  conflict_description: string
+  desired_resolution: string
+  additional_notes?: string
+  ai_generated_content?: string
+  final_content?: string
+  status: 'requested' | 'reviewing' | 'completed' | 'downloaded'
+  pdf_url?: string
+  created_at: string
+  reviewed_at?: string
+  completed_at?: string
+  downloaded_at?: string
+}
+
+export interface SubscriptionPlan {
+  id: string
+  name: string
+  description: string
+  letter_count: number
+  price: number
+  billing_cycle: 'one-time' | 'yearly'
+  features: string[]
+  is_active: boolean
+}
+
+export interface UserSubscription {
+  id: string
+  user_id: string
+  plan_id: string
+  plan?: SubscriptionPlan
+  discount_code_used?: string
+  original_price: number
+  discount_amount: number
+  final_price: number
+  letters_remaining: number
+  letters_used: number
+  status: 'active' | 'cancelled' | 'expired'
+  expires_at?: string
+  created_at: string
+}
+
+// ============================================
+// PART 6: AUTHENTICATION COMPONENTS (components/auth/AuthModal.tsx)
+// ============================================
+
+'use client'
+
+import { useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { createClient } from '@/lib/supabase/client'
+
+interface AuthModalProps {
+  mode?: 'login' | 'signup'
+}
+
+export function AuthModal({ mode: initialMode = 'login' }: AuthModalProps) {
+  const [mode, setMode] = useState(initialMode)
+  const [userType, setUserType] = useState<'user' | 'employee'>('user')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const router = useRouter()
+  const supabase = createClient()
+
+  // Form state
+  const [formData, setFormData] = useState({
+    email: '',
+    password: '',
+    fullName: '',
+    phone: '',
+    companyName: ''
+  })
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setLoading(true)
+    setError(null)
+
+    try {
+      if (mode === 'signup') {
+        // Step 1: Create the auth user
+        const { data: authData, error: authError } = await supabase.auth.signUp({
+          email: formData.email,
+          password: formData.password,
+          options: {
+            data: {
+              full_name: formData.fullName,
+              user_type: userType
+            }
+          }
+        })
+
+        if (authError) throw authError
+
+        // Step 2: Create the profile (this happens via database trigger)
+        // The trigger automatically creates a profile when auth.users gets a new entry
+
+        // Step 3: If employee, generate discount code via edge function
+        if (userType === 'employee' && authData.user) {
+          const { error: fnError } = await supabase.functions.invoke('generate-employee-discount', {
+            body: { userId: authData.user.id }
+          })
+          
+          if (fnError) console.error('Error generating discount code:', fnError)
+        }
+
+        // Show success message
+        alert('Account created! Please check your email to verify your account.')
+        setMode('login')
+      } else {
+        // Login flow
+        const { data, error: authError } = await supabase.auth.signInWithPassword({
+          email: formData.email,
+          password: formData.password
+        })
+
+        if (authError) throw authError
+
+        // Get user profile to determine routing
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('user_type')
+          .eq('id', data.user.id)
+          .single()
+
+        // Route based on user type
+        if (profile?.user_type === 'employee') {
+          router.push('/employee/dashboard')
+        } else if (profile?.user_type === 'admin') {
+          router.push('/admin/dashboard')
+        } else {
+          router.push('/dashboard')
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || 'An error occurred')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="auth-modal">
+      <div className="auth-container">
+        <h2>{mode === 'login' ? 'Welcome Back' : 'Create Your Account'}</h2>
+        
+        {mode === 'signup' && (
+          <div className="user-type-selector">
+            <label>I am a:</label>
+            <div className="radio-group">
+              <label>
+                <input
+                  type="radio"
+                  value="user"
+                  checked={userType === 'user'}
+                  onChange={(e) => setUserType(e.target.value as 'user')}
+                />
+                User (Need Legal Letters)
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  value="employee"
+                  checked={userType === 'employee'}
+                  onChange={(e) => setUserType(e.target.value as 'employee')}
+                />
+                Employee (Earn Commissions)
+              </label>
+            </div>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit}>
+          {mode === 'signup' && (
+            <>
+              <input
+                type="text"
+                placeholder="Full Name"
+                value={formData.fullName}
+                onChange={(e) => setFormData({...formData, fullName: e.target.value})}
+                required
+              />
+              <input
+                type="tel"
+                placeholder="Phone Number"
+                value={formData.phone}
+                onChange={(e) => setFormData({...formData, phone: e.target.value})}
+              />
+              {userType === 'user' && (
+                <input
+                  type="text"
+                  placeholder="Company/Law Firm Name (Optional)"
+                  value={formData.companyName}
+                  onChange={(e) => setFormData({...formData, companyName: e.target.value})}
+                />
+              )}
+            </>
+          )}
+          
+          <input
+            type="email"
+            placeholder="Email Address"
+            value={formData.email}
+            onChange={(e) => setFormData({...formData, email: e.target.value})}
+            required
+          />
+          
+          <input
+            type="password"
+            placeholder="Password"
+            value={formData.password}
+            onChange={(e) => setFormData({...formData, password: e.target.value})}
+            required
+            minLength={6}
+          />
+
+          {error && <div className="error-message">{error}</div>}
+
+          <button type="submit" disabled={loading}>
+            {loading ? 'Processing...' : mode === 'login' ? 'Sign In' : 'Create Account'}
+          </button>
+        </form>
+
+        <div className="auth-switch">
+          {mode === 'login' ? (
+            <p>Don't have an account? <a onClick={() => setMode('signup')}>Sign up</a></p>
+          ) : (
+            <p>Already have an account? <a onClick={() => setMode('login')}>Sign in</a></p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================
+// PART 7: LETTER GENERATION FORM (app/(user)/dashboard/page.tsx)
+// ============================================
+
+'use client'
+
+import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
+import { createClient } from '@/lib/supabase/client'
+import { Letter, UserSubscription } from '@/types'
+
+export default function UserDashboard() {
+  const [step, setStep] = useState(1)
+  const [subscription, setSubscription] = useState<UserSubscription | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [letterStatus, setLetterStatus] = useState<string | null>(null)
+  const router = useRouter()
+  const supabase = createClient()
+
+  // Form data state
+  const [letterData, setLetterData] = useState({
+    // Sender information
+    sender_name: '',
+    sender_firm_name: '',
+    sender_address: {
+      street: '',
+      city: '',
+      state: '',
+      zip: '',
+      country: 'USA'
+    },
+    // Recipient information
+    recipient_name: '',
+    recipient_address: {
+      street: '',
+      city: '',
+      state: '',
+      zip: '',
+      country: 'USA'
+    },
+    // Letter content
+    subject: '',
+    conflict_description: '',
+    desired_resolution: '',
+    additional_notes: ''
+  })
+
+  // Check user's subscription on mount
+  useEffect(() => {
+    checkSubscription()
+  }, [])
+
+  const checkSubscription = async () => {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      router.push('/login')
+      return
+    }
+
+    const { data: sub } = await supabase
+      .from('user_subscriptions')
+      .select('*, plan:subscription_plans(*)')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .single()
+
+    setSubscription(sub)
+  }
+
+  const handleGenerateLetter = async () => {
+    if (!subscription || subscription.letters_remaining <= 0) {
+      alert('You need an active subscription to generate letters')
+      router.push('/subscription')
+      return
+    }
+
+    setLoading(true)
+    setLetterStatus('requested')
+
+    try {
+      // Call API to generate letter
+      const response = await fetch('/api/letters/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(letterData)
+      })
+
+      const result = await response.json()
+
+      if (result.success) {
+        // Start polling for status updates
+        pollLetterStatus(result.letterId)
+      } else {
+        throw new Error(result.error)
+      }
+    } catch (error) {
+      console.error('Error generating letter:', error)
+      alert('Failed to generate letter. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const pollLetterStatus = async (letterId: string) => {
+    const interval = setInterval(async () => {
+      const { data: letter } = await supabase
+        .from('letters')
+        .select('status, pdf_url')
+        .eq('id', letterId)
+        .single()
+
+      setLetterStatus(letter?.status || 'requested')
+
+      if (letter?.status === 'completed') {
+        clearInterval(interval)
+        // Show download button
+      }
+    }, 2000) // Poll every 2 seconds
+  }
+
+  // Multi-step form renderer
+  const renderStep = () => {
+    switch(step) {
+      case 1:
+        return (
+          <div className="form-step">
+            <h3>Step 1: Sender Information</h3>
+            <input
+              placeholder="Your Full Name"
+              value={letterData.sender_name}
+              onChange={(e) => setLetterData({...letterData, sender_name: e.target.value})}
+              required
+            />
+            <input
+              placeholder="Law Firm Name (Optional)"
+              value={letterData.sender_firm_name}
+              onChange={(e) => setLetterData({...letterData, sender_firm_name: e.target.value})}
+            />
+            <input
+              placeholder="Street Address"
+              value={letterData.sender_address.street}
+              onChange={(e) => setLetterData({
+                ...letterData, 
+                sender_address: {...letterData.sender_address, street: e.target.value}
+              })}
+              required
+            />
+            <div className="address-row">
+              <input
+                placeholder="City"
+                value={letterData.sender_address.city}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  sender_address: {...letterData.sender_address, city: e.target.value}
+                })}
+                required
+              />
+              <input
+                placeholder="State"
+                value={letterData.sender_address.state}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  sender_address: {...letterData.sender_address, state: e.target.value}
+                })}
+                required
+              />
+              <input
+                placeholder="ZIP Code"
+                value={letterData.sender_address.zip}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  sender_address: {...letterData.sender_address, zip: e.target.value}
+                })}
+                required
+              />
+            </div>
+            <button onClick={() => setStep(2)}>Next: Recipient Information</button>
+          </div>
+        )
+      
+      case 2:
+        return (
+          <div className="form-step">
+            <h3>Step 2: Recipient Information</h3>
+            <input
+              placeholder="Recipient Full Name"
+              value={letterData.recipient_name}
+              onChange={(e) => setLetterData({...letterData, recipient_name: e.target.value})}
+              required
+            />
+            <input
+              placeholder="Street Address"
+              value={letterData.recipient_address.street}
+              onChange={(e) => setLetterData({
+                ...letterData,
+                recipient_address: {...letterData.recipient_address, street: e.target.value}
+              })}
+              required
+            />
+            <div className="address-row">
+              <input
+                placeholder="City"
+                value={letterData.recipient_address.city}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  recipient_address: {...letterData.recipient_address, city: e.target.value}
+                })}
+                required
+              />
+              <input
+                placeholder="State"
+                value={letterData.recipient_address.state}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  recipient_address: {...letterData.recipient_address, state: e.target.value}
+                })}
+                required
+              />
+              <input
+                placeholder="ZIP Code"
+                value={letterData.recipient_address.zip}
+                onChange={(e) => setLetterData({
+                  ...letterData,
+                  recipient_address: {...letterData.recipient_address, zip: e.target.value}
+                })}
+                required
+              />
+            </div>
+            <div className="button-row">
+              <button onClick={() => setStep(1)}>Previous</button>
+              <button onClick={() => setStep(3)}>Next: Letter Details</button>
+            </div>
+          </div>
+        )
+      
+      case 3:
+        return (
+          <div className="form-step">
+            <h3>Step 3: Letter Details</h3>
+            <input
+              placeholder="Subject/Matter"
+              value={letterData.subject}
+              onChange={(e) => setLetterData({...letterData, subject: e.target.value})}
+              required
+            />
+            <textarea
+              placeholder="Describe the conflict or issue in detail"
+              value={letterData.conflict_description}
+              onChange={(e) => setLetterData({...letterData, conflict_description: e.target.value})}
+              rows={5}
+              required
+            />
+            <textarea
+              placeholder="What resolution are you seeking?"
+              value={letterData.desired_resolution}
+              onChange={(e) => setLetterData({...letterData, desired_resolution: e.target.value})}
+              rows={4}
+              required
+            />
+            <textarea
+              placeholder="Additional notes or context (optional)"
+              value={letterData.additional_notes}
+              onChange={(e) => setLetterData({...letterData, additional_notes: e.target.value})}
+              rows={3}
+            />
+            <div className="button-row">
+              <button onClick={() => setStep(2)}>Previous</button>
+              <button onClick={() => setStep(4)}>Review & Generate</button>
+            </div>
+          </div>
+        )
+      
+      case 4:
+        return (
+          <div className="form-step review">
+            <h3>Step 4: Review Your Letter Request</h3>
+            <div className="review-section">
+              <h4>Sender</h4>
+              <p>{letterData.sender_name}</p>
+              <p>{letterData.sender_firm_name}</p>
+              <p>{letterData.sender_address.street}</p>
+              <p>{letterData.sender_address.city}, {letterData.sender_address.state} {letterData.sender_address.zip}</p>
+            </div>
+            <div className="review-section">
+              <h4>Recipient</h4>
+              <p>{letterData.recipient_name}</p>
+              <p>{letterData.recipient_address.street}</p>
+              <p>{letterData.recipient_address.city}, {letterData.recipient_address.state} {letterData.recipient_address.zip}</p>
+            </div>
+            <div className="review-section">
+              <h4>Subject</h4>
+              <p>{letterData.subject}</p>
+            </div>
+            <div className="subscription-info">
+              <p>Letters Remaining: {subscription?.letters_remaining || 0}</p>
+            </div>
+            <div className="button-row">
+              <button onClick={() => setStep(3)}>Edit Details</button>
+              <button 
+                className="generate-button"
+                onClick={handleGenerateLetter}
+                disabled={loading || !subscription || subscription.letters_remaining <= 0}
+              >
+                {loading ? 'Generating...' : 'Generate Letter'}
+              </button>
+            </div>
+          </div>
+        )
+    }
+  }
+
+  // Timeline component for showing letter status
+  const Timeline = ({ status }: { status: string | null }) => {
+    const stages = [
+      { key: 'requested', label: 'Request Received', icon: '📨' },
+      { key: 'reviewing', label: 'Attorney Review', icon: '⚖️' },
+      { key: 'completed', label: 'Letter Ready', icon: '✅' },
+      { key: 'downloaded', label: 'Download Available', icon: '📄' }
+    ]
+
+    const getStageStatus = (stageKey: string) => {
+      const stageOrder = ['requested', 'reviewing', 'completed', 'downloaded']
+      const currentIndex = stageOrder.indexOf(status || 'requested')
+      const stageIndex = stageOrder.indexOf(stageKey)
+      
+      if (stageIndex < currentIndex) return 'completed'
+      if (stageIndex === currentIndex) return 'active'
+      return 'pending'
+    }
+
+    return (
+      <div className="timeline-container">
+        {stages.map((stage, index) => (
+          <div key={stage.key} className={`timeline-step ${getStageStatus(stage.key)}`}>
+            <div className="timeline-icon">{stage.icon}</div>
+            <div className="timeline-label">{stage.label}</div>
+            {index < stages.length - 1 && <div className="timeline-connector" />}
+          </div>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <div className="dashboard-container">
+      <h1>Generate Legal Letter</h1>
+      
+      {letterStatus ? (
+        <div className="letter-status">
+          <h2>Your Letter Status</h2>
+          <Timeline status={letterStatus} />
+          {letterStatus === 'completed' && (
+            <div className="action-buttons">
+              <button className="preview-button">Preview Letter</button>
+              <button className="download-button">Download PDF</button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="form-container">
+          <div className="step-indicator">
+            {[1, 2, 3, 4].map(num => (
+              <div key={num} className={`step ${step === num ? 'active' : step > num ? 'completed' : ''}`}>
+                {num}
+              </div>
+            ))}
+          </div>
+          {renderStep()}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ============================================
+// PART 8: EMPLOYEE DASHBOARD (app/(employee)/dashboard/page.tsx)
+// ============================================
+
+'use client'
+
+import { useState, useEffect } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { Employee } from '@/types'
+
+export default function EmployeeDashboard() {
+  const [employee, setEmployee] = useState<Employee | null>(null)
+  const [commissions, setCommissions] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const [copied, setCopied] = useState(false)
+  const supabase = createClient()
+
+  useEffect(() => {
+    loadEmployeeData()
+  }, [])
+
+  const loadEmployeeData = async () => {
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      if (!user) return
+
+      // Get employee profile with discount code
+      const { data: empData } = await supabase
+        .from('employees')
+        .select('*, profile:profiles(*)')
+        .eq('id', user.id)
+        .single()
+
+      setEmployee(empData)
+
+      // Get commission records
+      const { data: commData } = await supabase
+        .from('commission_records')
+        .select('*, subscription:user_subscriptions(*, user:profiles(full_name, email))')
+        .eq('employee_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(10)
+
+      setCommissions(commData || [])
+    } catch (error) {
+      console.error('Error loading employee data:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const copyDiscountCode = () => {
+    if (employee?.discount_code) {
+      navigator.clipboard.writeText(employee.discount_code)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }
+
+  if (loading) return <div>Loading...</div>
+
+  return (
+    <div className="employee-dashboard">
+      {/* Animated Discount Code Display */}
+      <div className="discount-code-hero">
+        <div className="animated-border">
+          <div className="code-container">
+            <h2>Your Exclusive Discount Code</h2>
+            <div className="code-display">
+              <span className="code-text">{employee?.discount_code}</span>
+              <button 
+                className="copy-button"
+                onClick={copyDiscountCode}
+              >
+                {copied ? '✓ Copied!' : 'Copy Code'}
+              </button>
+            </div>
+            <div className="code-benefits">
+              <div className="benefit">
+                <span className="benefit-icon">💰</span>
+                <span>20% discount for customers</span>
+              </div>
+              <div className="benefit">
+                <span className="benefit-icon">📈</span>
+                <span>5% commission on each sale</span>
+              </div>
+              <div className="benefit">
+                <span className="benefit-icon">🏆</span>
+                <span>1 point per successful referral</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Performance Stats */}
+      <div className="stats-grid">
+        <div className="stat-card">
+          <h3>Total Commission</h3>
+          <p className="stat-value">${employee?.total_commission?.toFixed(2) || '0.00'}</p>
+        </div>
+        <div className="stat-card">
+          <h3>Total Points</h3>
+          <p className="stat-value">{employee?.total_points || 0}</p>
+        </div>
+        <div className="stat-card">
+          <h3>Performance Tier</h3>
+          <p className="stat-value tier">{employee?.performance_tier || 'Bronze'}</p>
+        </div>
+        <div className="stat-card">
+          <h3>Commission Rate</h3>
+          <p className="stat-value">{((employee?.commission_rate || 0.05) * 100).toFixed(1)}%</p>
+        </div>
+      </div>
+
+      {/* Recent Commissions */}
+      <div className="commissions-section">
+        <h2>Recent Commissions</h2>
+        <div className="commissions-table">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Customer</th>
+                <th>Sale Amount</th>
+                <th>Commission</th>
+                <th>Points</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {commissions.map(comm => (
+                <tr key={comm.id}>
+                  <td>{new Date(comm.created_at).toLocaleDateString()}</td>
+                  <td>{comm.subscription?.user?.full_name || 'N/A'}</td>
+                  <td>${comm.subscription?.final_price?.toFixed(2) || '0.00'}</td>
+                  <td>${comm.commission_amount?.toFixed(2) || '0.00'}</td>
+                  <td>{comm.points_earned}</td>
+                  <td>
+                    <span className={`status ${comm.status}`}>
+                      {comm.status}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* How It Works Section */}
+      <div className="how-it-works">
+        <h2>How to Maximize Your Earnings</h2>
+        <div className="steps">
+          <div className="step">
+            <div className="step-number">1</div>
+            <h3>Share Your Code</h3>
+            <p>Give your discount code to potential customers who need legal letters</p>
+          </div>
+          <div className="step">
+            <div className="step-number">2</div>
+            <h3>Customer Signs Up</h3>
+            <p>They use your code during signup to get 20% off their subscription</p>
+          </div>
+          <div className="step">
+            <div className="step-number">3</div>
+            <h3>Earn Commission</h3>
+            <p>You automatically earn 5% commission and 1 point for each sale</p>
+          </div>
+          <div className="step">
+            <div className="step-number">4</div>
+            <h3>Level Up</h3>
+            <p>Reach higher tiers for increased commission rates and bonuses</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ============================================
+// PART 9: API ROUTES FOR LETTER GENERATION (app/api/letters/generate/route.ts)
+// ============================================
+
+import { NextRequest, NextResponse } from 'next/server'
+import { createServerSupabaseClient } from '@/lib/supabase/server'
+
+export async function POST(request: NextRequest) {
+  try {
+    const supabase = await createServerSupabaseClient()
+    
+    // Get authenticated user
+    const { data: { user }, error: authError } = await supabase.auth.getUser()
+    if (authError || !user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Parse request body
+    const letterData = await request.json()
+
+    // Check user's subscription
+    const { data: subscription, error: subError } = await supabase
+      .from('user_subscriptions')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .gt('letters_remaining', 0)
+      .single()
+
+    if (subError || !subscription) {
+      return NextResponse.json({ 
+        error: 'No active subscription or no letters remaining' 
+      }, { status: 403 })
+    }
+
+    // Create letter record
+    const { data: letter, error: letterError } = await supabase
+      .from('letters')
+      .insert({
+        user_id: user.id,
+        subscription_id: subscription.id,
+        ...letterData,
+        status: 'requested'
+      })
+      .select()
+      .single()
+
+    if (letterError) {
+      throw letterError
+    }
+
+    // Trigger AI generation via edge function
+    const { error: fnError } = await supabase.functions.invoke('generate-letter-content', {
+      body: { 
+        letterId: letter.id,
+        letterData: letterData 
+      }
+    })
+
+    if (fnError) {
+      console.error('Edge function error:', fnError)
+    }
+
+    // Update subscription letter count
+    await supabase
+      .from('user_subscriptions')
+      .update({
+        letters_remaining: subscription.letters_remaining - 1,
+        letters_used: subscription.letters_used + 1
+      })
+      .eq('id', subscription.id)
+
+    return NextResponse.json({ 
+      success: true, 
+      letterId: letter.id 
+    })
+
+  } catch (error) {
+    console.error('Letter generation error:', error)
+    return NextResponse.json({ 
+      error: 'Failed to generate letter' 
+    }, { status: 500 })
+  }
+}
+
+// ============================================
+// PART 10: EDGE FUNCTION FOR AI GENERATION (supabase/functions/generate-letter-content/index.ts)
+// ============================================
+
+import { serve } from 'https://deno.land/std@0.168.0/http/server.ts'
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+}
+
+serve(async (req) => {
+  // Handle CORS
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: corsHeaders })
+  }
+
+  try {
+    const { letterId, letterData } = await req.json()
+
+    // Initialize Supabase client
+    const supabase = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    )
+
+    // Update status to reviewing
+    await supabase
+      .from('letters')
+      .update({ status: 'reviewing' })
+      .eq('id', letterId)
+
+    // Construct the prompt for Gemini
+    const prompt = `
+      Generate a professional legal letter with the following details:
+      
+      From: ${letterData.sender_name}
+      ${letterData.sender_firm_name ? `Law Firm: ${letterData.sender_firm_name}` : ''}
+      Address: ${letterData.sender_address.street}, ${letterData.sender_address.city}, ${letterData.sender_address.state} ${letterData.sender_address.zip}
+      
+      To: ${letterData.recipient_name}
+      Address: ${letterData.recipient_address.street}, ${letterData.recipient_address.city}, ${letterData.recipient_address.state} ${letterData.recipient_address.zip}
+      
+      Subject: ${letterData.subject}
+      
+      Conflict Description: ${letterData.conflict_description}
+      
+      Desired Resolution: ${letterData.desired_resolution}
+      
+      ${letterData.additional_notes ? `Additional Context: ${letterData.additional_notes}` : ''}
+      
+      Please generate a formal, professional legal letter that:
+      1. Uses appropriate legal language and formatting
+      2. Clearly states the issue
+      3. References relevant laws or regulations if applicable
+      4. Proposes the desired resolution
+      5. Sets a reasonable timeline for response
+      6. Maintains a professional but firm tone
+      
+      Format the letter with proper business letter structure including date, addresses, salutation, body paragraphs, and closing.
+    `
+
+    // Call Gemini API (you'll need to set up your API key)
+    const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': Deno.env.get('GEMINI_API_KEY') ?? ''
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: prompt
+          }]
+        }]
+      })
+    })
+
+    const geminiData = await geminiResponse.json()
+    const generatedContent = geminiData.candidates[0].content.parts[0].text
+
+    // Update letter with AI-generated content
+    await supabase
+      .from('letters')
+      .update({
+        ai_generated_content: generatedContent,
+        ai_generated_at: new Date().toISOString(),
+        status: 'completed',
+        final_content: generatedContent, // In production, this would go through attorney review
+        completed_at: new Date().toISOString()
+      })
+      .eq('id', letterId)
+
+    // Trigger PDF generation
+    await supabase.functions.invoke('generate-pdf', {
+      body: { letterId }
+    })
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+    )
+
+  } catch (error) {
+    console.error('Error:', error)
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 500 }
+    )
+  }
+})
+
+// ============================================
+// PART 11: ADMIN DASHBOARD (app/admin/dashboard/page.tsx)
+// ============================================
+
+'use client'
+
+import { useState, useEffect } from 'react'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+
+interface AdminStats {
+  totalUsers: number
+  totalEmployees: number
+  totalLetters: number
+  totalRevenue: number
+  activeSubscriptions: number
+}
+
+export default function AdminDashboard() {
+  const [activeTab, setActiveTab] = useState<'users' | 'employees'>('users')
+  const [stats, setStats] = useState<AdminStats | null>(null)
+  const [users, setUsers] = useState<any[]>([])
+  const [employees, setEmployees] = useState<any[]>([])
+  const [loading, setLoading] = useState(true)
+  const supabase = createClient()
+  const router = useRouter()
+
+  useEffect(() => {
+    checkAdminAccess()
+    loadDashboardData()
+  }, [])
+
+  const checkAdminAccess = async () => {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) {
+      router.push('/admin/login')
+      return
+    }
+
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('user_type')
+      .eq('id', user.id)
+      .single()
+
+    if (profile?.user_type !== 'admin') {
+      router.push('/')
+    }
+  }
+
+  const loadDashboardData = async () => {
+    try {
+      // Load statistics
+      const [
+        { count: userCount },
+        { count: employeeCount },
+        { count: letterCount },
+        { data: subscriptions },
+        { data: revenue }
+      ] = await Promise.all([
+        supabase.from('profiles').select('*', { count: 'exact', head: true }).eq('user_type', 'user'),
+        supabase.from('employees').select('*', { count: 'exact', head: true }),
+        supabase.from('letters').select('*', { count: 'exact', head: true }),
+        supabase.from('user_subscriptions').select('*').eq('status', 'active'),
+        supabase.from('user_subscriptions').select('final_price')
+      ])
+
+      const totalRevenue = revenue?.reduce((sum, sub) => sum + (sub.final_price || 0), 0) || 0
+
+      setStats({
+        totalUsers: userCount || 0,
+        totalEmployees: employeeCount || 0,
+        totalLetters: letterCount || 0,
+        totalRevenue,
+        activeSubscriptions: subscriptions?.length || 0
+      })
+
+      // Load user data
+      if (activeTab === 'users') {
+        const { data: userData } = await supabase
+          .from('profiles')
+          .select(`
+            *,
+            letters:letters(count),
+            subscriptions:user_subscriptions(*)
+          `)
+          .eq('user_type', 'user')
+          .order('created_at', { ascending: false })
+
+        setUsers(userData || [])
+      } else {
+        // Load employee data
+        const { data: empData } = await supabase
+          .from('employees')
+          .select(`
+            *,
+            profile:profiles(*),
+            commissions:commission_records(*)
+          `)
+          .order('total_commission', { ascending: false })
+
+        setEmployees(empData || [])
+      }
+    } catch (error) {
+      console.error('Error loading dashboard data:', error)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadDashboardData()
+  }, [activeTab])
+
+  if (loading) return <div>Loading admin dashboard...</div>
+
+  return (
+    <div className="admin-dashboard">
+      <h1>Admin Dashboard</h1>
+
+      {/* Statistics Overview */}
+      <div className="stats-overview">
+        <div className="stat-box">
+          <h3>Total Users</h3>
+          <p>{stats?.totalUsers || 0}</p>
+        </div>
+        <div className="stat-box">
+          <h3>Total Employees</h3>
+          <p>{stats?.totalEmployees || 0}</p>
+        </div>
+        <div className="stat-box">
+          <h3>Letters Generated</h3>
+          <p>{stats?.totalLetters || 0}</p>
+        </div>
+        <div className="stat-box">
+          <h3>Total Revenue</h3>
+          <p>${stats?.totalRevenue?.toFixed(2) || '0.00'}</p>
+        </div>
+        <div className="stat-box">
+          <h3>Active Subscriptions</h3>
+          <p>{stats?.activeSubscriptions || 0}</p>
+        </div>
+      </div>
+
+      {/* Tab Navigation */}
+      <div className="tab-navigation">
+        <button 
+          className={activeTab === 'users' ? 'active' : ''}
+          onClick={() => setActiveTab('users')}
+        >
+          Users
+        </button>
+        <button 
+          className={activeTab === 'employees' ? 'active' : ''}
+          onClick={() => setActiveTab('employees')}
+        >
+          Employees
+        </button>
+      </div>
+
+      {/* Tab Content */}
+      <div className="tab-content">
+        {activeTab === 'users' ? (
+          <div className="users-section">
+            <h2>User Management</h2>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Email</th>
+                  <th>Company</th>
+                  <th>Letters Generated</th>
+                  <th>Active Subscription</th>
+                  <th>Total Spent</th>
+                  <th>Joined</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map(user => (
+                  <tr key={user.id}>
+                    <td>{user.full_name}</td>
+                    <td>{user.email}</td>
+                    <td>{user.company_name || '-'}</td>
+                    <td>{user.letters?.[0]?.count || 0}</td>
+                    <td>
+                      {user.subscriptions?.find((s: any) => s.status === 'active') 
+                        ? 'Yes' 
+                        : 'No'}
+                    </td>
+                    <td>
+                      ${user.subscriptions?.reduce((sum: number, sub: any) => 
+                        sum + (sub.final_price || 0), 0
+                      ).toFixed(2) || '0.00'}
+                    </td>
+                    <td>{new Date(user.created_at).toLocaleDateString()}</td>
+                    <td>
+                      <button className="action-btn">View Details</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="employees-section">
+            <h2>Employee Management</h2>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Email</th>
+                  <th>Discount Code</th>
+                  <th>Total Commission</th>
+                  <th>Total Points</th>
+                  <th>Performance Tier</th>
+                  <th>Code Uses</th>
+                  <th>Revenue Generated</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {employees.map(emp => (
+                  <tr key={emp.id}>
+                    <td>{emp.profile?.full_name}</td>
+                    <td>{emp.profile?.email}</td>
+                    <td>
+                      <code>{emp.discount_code}</code>
+                    </td>
+                    <td>${emp.total_commission?.toFixed(2) || '0.00'}</td>
+                    <td>{emp.total_points || 0}</td>
+                    <td>
+                      <span className={`tier ${emp.performance_tier}`}>
+                        {emp.performance_tier}
+                      </span>
+                    </td>
+                    <td>{emp.commissions?.length || 0}</td>
+                    <td>
+                      ${emp.commissions?.reduce((sum: number, comm: any) => 
+                        sum + (comm.commission_amount / emp.commission_rate), 0
+                      ).toFixed(2) || '0.00'}
+                    </td>
+                    <td>
+                      <button className="action-btn">View Details</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ============================================
+// PART 12: CSS STYLES (app/globals.css)
+// ============================================
+
+const globalStyles = `
+/* Root variables for consistent theming */
+:root {
+  --primary-color: #2563eb;
+  --secondary-color: #7c3aed;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --error-color: #ef4444;
+  --text-primary: #1f2937;
+  --text-secondary: #6b7280;
+  --border-color: #e5e7eb;
+  --background: #ffffff;
+  --background-secondary: #f9fafb;
+}
+
+/* Authentication Modal Styles */
+.auth-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.auth-container {
+  background: white;
+  padding: 2rem;
+  border-radius: 12px;
+  width: 100%;
+  max-width: 400px;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+}
+
+.user-type-selector {
+  margin: 1.5rem 0;
+}
+
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.radio-group label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+/* Dashboard Styles */
+.dashboard-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.form-container {
+  background: white;
+  border-radius: 12px;
+  padding: 2rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.step-indicator {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2rem;
+  position: relative;
+}
+
+.step-indicator::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--border-color);
+  z-index: 0;
+}
+
+.step {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: white;
+  border: 2px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  position: relative;
+  z-index: 1;
+}
+
+.step.active {
+  background: var(--primary-color);
+  color: white;
+  border-color: var(--primary-color);
+}
+
+.step.completed {
+  background: var(--success-color);
+  color: white;
+  border-color: var(--success-color);
+}
+
+/* Timeline Styles */
+.timeline-container {
+  display: flex;
+  justify-content: space-between;
+  padding: 2rem 0;
+  position: relative;
+}
+
+.timeline-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  position: relative;
+}
+
+.timeline-icon {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+  filter: grayscale(100%);
+  opacity: 0.5;
+  transition: all 0.3s ease;
+}
+
+.timeline-step.active .timeline-icon,
+.timeline-step.completed .timeline-icon {
+  filter: grayscale(0%);
+  opacity: 1;
+}
+
+.timeline-label {
+  text-align: center;
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+.timeline-step.active .timeline-label {
+  color: var(--primary-color);
+  font-weight: 600;
+}
+
+.timeline-connector {
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  background: var(--border-color);
+  z-index: -1;
+}
+
+/* Employee Dashboard Styles */
+.employee-dashboard {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.discount-code-hero {
+  margin-bottom: 3rem;
+}
+
+.animated-border {
+  background: linear-gradient(45deg, #667eea 0%, #764ba2 100%);
+  padding: 4px;
+  border-radius: 16px;
+  animation: gradient-shift 3s ease infinite;
+}
+
+@keyframes gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+
+.code-container {
+  background: white;
+  padding: 2rem;
+  border-radius: 12px;
+  text-align: center;
+}
+
+.code-display {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.code-text {
+  font-size: 1.75rem;
+  font-weight: bold;
+  font-family: 'Courier New', monospace;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.copy-button {
+  padding: 0.75rem 1.5rem;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.copy-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+}
+
+.code-benefits {
+  display: flex;
+  justify-content: space-around;
+  margin-top: 2rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.benefit {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.benefit-icon {
+  font-size: 1.25rem;
+}
+
+/* Stats Grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 3rem;
+}
+
+.stat-card {
+  background: white;
+  padding: 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.stat-card h3 {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.stat-value {
+  font-size: 2rem;
+  font-weight: bold;
+  color: var(--text-primary);
+}
+
+.stat-value.tier {
+  text-transform: capitalize;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Admin Dashboard Styles */
+.admin-dashboard {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.stats-overview {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 3rem;
+}
+
+.stat-box {
+  background: white;
+  padding: 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  text-align: center;
+}
+
+.stat-box h3 {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.stat-box p {
+  font-size: 1.75rem;
+  font-weight: bold;
+  color: var(--primary-color);
+}
+
+/* Tab Navigation */
+.tab-navigation {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 2rem;
+  border-bottom: 2px solid var(--border-color);
+}
+
+.tab-navigation button {
+  padding: 0.75rem 1.5rem;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-weight: 600;
+  cursor: pointer;
+  position: relative;
+  transition: color 0.2s;
+}
+
+.tab-navigation button.active {
+  color: var(--primary-color);
+}
+
+.tab-navigation button.active::after {
+  content: '';
+  position: absolute;
+  bottom: -2px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--primary-color);
+}
+
+/* Data Table Styles */
+.data-table {
+  width: 100%;
+  background: white;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+}
+
+.data-table thead {
+  background: var(--background-secondary);
+}
+
+.data-table th {
+  padding: 1rem;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.data-table td {
+  padding: 1rem;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+
+.data-table tbody tr:hover {
+  background: var(--background-secondary);
+}
+
+.action-btn {
+  padding: 0.5rem 1rem;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.action-btn:hover {
+  background: #1d4ed8;
+}
+
+/* Form Elements */
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="tel"],
+textarea {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  font-size: 1rem;
+  margin-bottom: 1rem;
+  transition: border-color 0.2s;
+}
+
+input:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--primary-color);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+button {
+  padding: 0.75rem 1.5rem;
+  background: var(--primary-color);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+button:hover {
+  background: #1d4ed8;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);
+}
+
+button:disabled {
+  background: var(--text-secondary);
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .stats-grid,
+  .stats-overview {
+    grid-template-columns: 1fr;
+  }
+  
+  .timeline-container {
+    flex-direction: column;
+    gap: 1rem;
+  }
+  
+  .code-benefits {
+    flex-direction: column;
+  }
+  
+  .data-table {
+    font-size: 0.875rem;
+  }
+  
+  .data-table th,
+  .data-table td {
+    padding: 0.5rem;
+  }
+}
+`;
+
+// ============================================
+// PART 13: ENVIRONMENT VARIABLES (.env.local)
+// ============================================
+
+const envVariables = `
+# Supabase Configuration
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_project_url
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+
+# Gemini API Configuration
+GEMINI_API_KEY=your_gemini_api_key
+
+# Stripe Configuration (for payment processing)
+STRIPE_SECRET_KEY=your_stripe_secret_key
+NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=your_stripe_publishable_key
+STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret
+
+# Application Configuration
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+ADMIN_URL=/admin
+`;
+
+// ============================================
+// PART 14: PACKAGE.JSON DEPENDENCIES
+// ============================================
+
+const packageJson = `
+{
+  "name": "legal-letter-platform",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "supabase": "supabase"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "@supabase/ssr": "^0.1.0",
+    "next": "14.1.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "stripe": "^14.0.0",
+    "@react-pdf/renderer": "^3.0.0",
+    "date-fns": "^3.0.0",
+    "recharts": "^2.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5.3.0",
+    "eslint": "^8.0.0",
+    "eslint-config-next": "14.1.0",
+    "supabase": "^1.131.0",
+    "tailwindcss": "^3.4.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.4.0"
+  }
+}
+`;
+</artifact>
+</artifacts>
+
+Let me explain the key architectural decisions and how this implementation addresses your requirements:
+
+## Understanding the Architecture
+
+Think of this application as a three-story building where each floor serves different people with different access levels. The ground floor is for regular users who need legal letters, the second floor is for employees who earn commissions, and the top floor is the admin control center that oversees everything.
+
+### Why Supabase + Next.js?
+
+I chose this combination because Supabase provides us with a complete backend-as-a-service solution. It's like having a Swiss Army knife for developers - you get authentication, a PostgreSQL database, real-time subscriptions, file storage, and serverless functions all in one package. Next.js complements this perfectly with its full-stack capabilities, allowing us to build both the frontend and API routes in a single project.
+
+### Database Design Philosophy
+
+The database structure follows a principle called "single source of truth." Every piece of data has one authoritative location. For example, user profiles extend Supabase's built-in authentication system, ensuring we never have conflicting user data. The `profiles` table acts as our central hub, with specialized tables like `employees` adding role-specific information.
+
+### Security Through Row Level Security (RLS)
+
+RLS policies work like security guards at different checkpoints in your application. They automatically filter data based on who's asking for it. When a regular user queries letters, they only see their own. When an admin queries the same table, they see everything. This happens at the database level, making it impossible to bypass through clever client-side manipulation.
+
+### The Multi-Step Letter Generation Process
+
+The letter generation follows a carefully orchestrated workflow:
+
+1. **User fills the form**: Data validation happens at each step
+2. **Subscription check**: Ensures they have letters remaining
+3. **Database record creation**: Letter marked as "requested"
+4. **AI generation trigger**: Edge function calls Gemini API
+5. **Status updates**: Real-time updates keep user informed
+6. **PDF generation**: Professional document created
+7. **Delivery**: User can preview and download
+
+### Employee Commission System
+
+The commission tracking system automatically:
+- Validates discount codes during signup
+- Calculates the 20% discount for users
+- Records the 5% commission for employees
+- Awards points for gamification
+- Updates performance tiers based on total sales
+
+### Admin Dashboard Intelligence
+
+The admin dashboard aggregates data from multiple tables to provide insights. It uses database joins to connect users with their letters, subscriptions, and payment history. For employees, it tracks discount code usage and calculates total revenue generated.
+
+### Scalability Considerations
+
+This architecture scales horizontally. As your user base grows:
+- Supabase automatically handles database scaling
+- Edge functions run close to users for low latency
+- Next.js can be deployed on Vercel for automatic scaling
+- PDF generation can be moved to a queue system if needed
+
+### Payment Integration Ready
+
+While I've outlined the subscription structure, you'll need to integrate Stripe for actual payment processing. The `stripe_subscription_id` and `stripe_customer_id` fields are already in place, ready for webhook handlers that update subscription status based on payment events.
+
+## Next Steps for Implementation
+
+1. **Set up Supabase Project**: Create a new project and run the database migrations
+2. **Configure Authentication**: Set up email templates and authentication flows
+3. **Deploy Edge Functions**: Upload the letter generation and PDF creation functions
+4. **Integrate Stripe**: Add payment processing for subscriptions
+5. **Configure Gemini API**: Set up your API key for AI letter generation
+6. **Style the UI**: Customize the CSS to match your brand
+7. **Add Error Handling**: Implement comprehensive error boundaries and user feedback
+
+This implementation provides a solid foundation that handles all your requirements while remaining flexible enough to grow with your business. The separation of concerns ensures that changes to one part of the system don't cascade throughout, and the type safety from TypeScript helps prevent runtime errors.
+
+Would you like me to elaborate on any specific component, such as the Stripe integration, PDF generation details, or the real-time subscription tracking system?
