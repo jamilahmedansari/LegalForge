@@ -1,5 +1,24 @@
-import { type User, type InsertUser, type Employee, type InsertEmployee, type Letter, type InsertLetter, type SubscriptionPlan, type UserSubscription, type InsertUserSubscription, type CommissionRecord } from "@shared/schema";
-import { randomUUID } from "crypto";
+import { 
+  type User, 
+  type InsertUser, 
+  type Employee, 
+  type InsertEmployee, 
+  type Letter, 
+  type InsertLetter, 
+  type SubscriptionPlan, 
+  type UserSubscription, 
+  type InsertUserSubscription, 
+  type CommissionRecord,
+  users,
+  employees,
+  letters,
+  subscriptionPlans,
+  userSubscriptions,
+  commissionRecords
+} from "@shared/schema";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import { eq, and } from "drizzle-orm";
 
 export interface IStorage {
   // User methods
@@ -36,89 +55,92 @@ export interface IStorage {
   createCommissionRecord(record: Omit<CommissionRecord, 'id' | 'createdAt'>): Promise<CommissionRecord>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User> = new Map();
-  private employees: Map<string, Employee> = new Map();
-  private letters: Map<string, Letter> = new Map();
-  private subscriptionPlans: Map<string, SubscriptionPlan> = new Map();
-  private userSubscriptions: Map<string, UserSubscription> = new Map();
-  private commissionRecords: Map<string, CommissionRecord> = new Map();
+export class DatabaseStorage implements IStorage {
+  private db: ReturnType<typeof drizzle>;
 
   constructor() {
+    if (!process.env.DATABASE_URL) {
+      throw new Error('DATABASE_URL environment variable is required');
+    }
+    
+    const client = postgres(process.env.DATABASE_URL);
+    this.db = drizzle(client);
     this.initializeDefaultData();
   }
 
-  private initializeDefaultData() {
-    // Create default subscription plans
-    const singlePlan: SubscriptionPlan = {
-      id: randomUUID(),
-      name: 'Single Letter',
-      description: 'One professional legal letter',
-      letterCount: 1,
-      price: '299.00',
-      billingCycle: 'one-time',
-      isActive: true,
-      features: ['AI-generated content', 'Attorney review', 'PDF download'],
-      createdAt: new Date()
-    };
+  private async initializeDefaultData() {
+    try {
+      // Check if subscription plans already exist
+      const existingPlans = await this.db.select().from(subscriptionPlans);
+      
+      if (existingPlans.length === 0) {
+        // Create default subscription plans
+        const defaultPlans = [
+          {
+            name: 'Single Letter',
+            description: 'One professional legal letter',
+            letterCount: 1,
+            price: '299.00',
+            billingCycle: 'one-time' as const,
+            isActive: true,
+            features: ['AI-generated content', 'Attorney review', 'PDF download']
+          },
+          {
+            name: 'Monthly Plan',
+            description: 'Four letters per month',
+            letterCount: 48,
+            price: '299.00',
+            billingCycle: 'yearly' as const,
+            isActive: true,
+            features: ['48 letters/year', 'Priority review', 'PDF downloads', 'Email support']
+          },
+          {
+            name: 'Premium Plan',
+            description: 'Eight letters per month',
+            letterCount: 96,
+            price: '599.00',
+            billingCycle: 'yearly' as const,
+            isActive: true,
+            features: ['96 letters/year', 'Priority review', 'PDF downloads', 'Priority support', 'Custom templates']
+          }
+        ];
 
-    const monthlyPlan: SubscriptionPlan = {
-      id: randomUUID(),
-      name: 'Monthly Plan',
-      description: 'Four letters per month',
-      letterCount: 48,
-      price: '299.00',
-      billingCycle: 'yearly',
-      isActive: true,
-      features: ['48 letters/year', 'Priority review', 'PDF downloads', 'Email support'],
-      createdAt: new Date()
-    };
-
-    const premiumPlan: SubscriptionPlan = {
-      id: randomUUID(),
-      name: 'Premium Plan',
-      description: 'Eight letters per month',
-      letterCount: 96,
-      price: '599.00',
-      billingCycle: 'yearly',
-      isActive: true,
-      features: ['96 letters/year', 'Priority review', 'PDF downloads', 'Priority support', 'Custom templates'],
-      createdAt: new Date()
-    };
-
-    this.subscriptionPlans.set(singlePlan.id, singlePlan);
-    this.subscriptionPlans.set(monthlyPlan.id, monthlyPlan);
-    this.subscriptionPlans.set(premiumPlan.id, premiumPlan);
+        await this.db.insert(subscriptionPlans).values(defaultPlans);
+      }
+    } catch (error) {
+      console.error('Error initializing default data:', error);
+    }
   }
 
   // User methods
   async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+    const result = await this.db.select().from(users).where(eq(users.id, id));
+    return result[0];
   }
 
   async getUserByEmail(email: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(user => user.email === email);
+    const result = await this.db.select().from(users).where(eq(users.email, email));
+    return result[0];
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = {
+    const result = await this.db.insert(users).values({
       ...insertUser,
-      id,
-      createdAt: new Date(),
       updatedAt: new Date()
-    };
-    this.users.set(id, user);
-    return user;
+    }).returning();
+    return result[0];
   }
 
   async updateUser(id: string, updates: Partial<User>): Promise<User> {
-    const user = this.users.get(id);
-    if (!user) throw new Error('User not found');
+    const result = await this.db.update(users)
+      .set({ ...updates, updatedAt: new Date() })
+      .where(eq(users.id, id))
+      .returning();
     
-    const updatedUser = { ...user, ...updates, updatedAt: new Date() };
-    this.users.set(id, updatedUser);
-    return updatedUser;
+    if (result.length === 0) {
+      throw new Error('User not found');
+    }
+    return result[0];
   }
 
   async updateStripeCustomerId(userId: string, customerId: string): Promise<User> {
@@ -134,124 +156,121 @@ export class MemStorage implements IStorage {
 
   // Employee methods
   async getEmployee(id: string): Promise<Employee | undefined> {
-    return this.employees.get(id);
+    const result = await this.db.select().from(employees).where(eq(employees.id, id));
+    return result[0];
   }
 
   async getEmployeeByDiscountCode(code: string): Promise<Employee | undefined> {
-    return Array.from(this.employees.values()).find(emp => emp.discountCode === code);
+    const result = await this.db.select().from(employees).where(eq(employees.discountCode, code));
+    return result[0];
   }
 
   async createEmployee(insertEmployee: InsertEmployee): Promise<Employee> {
-    const employee: Employee = {
+    const result = await this.db.insert(employees).values({
       ...insertEmployee,
       totalCommission: '0.00',
-      totalPoints: 0,
-      createdAt: new Date()
-    };
-    this.employees.set(employee.id, employee);
-    return employee;
+      totalPoints: 0
+    }).returning();
+    return result[0];
   }
 
   async updateEmployee(id: string, updates: Partial<Employee>): Promise<Employee> {
-    const employee = this.employees.get(id);
-    if (!employee) throw new Error('Employee not found');
+    const result = await this.db.update(employees)
+      .set(updates)
+      .where(eq(employees.id, id))
+      .returning();
     
-    const updatedEmployee = { ...employee, ...updates };
-    this.employees.set(id, updatedEmployee);
-    return updatedEmployee;
+    if (result.length === 0) {
+      throw new Error('Employee not found');
+    }
+    return result[0];
   }
 
   async getAllEmployees(): Promise<Employee[]> {
-    return Array.from(this.employees.values());
+    return await this.db.select().from(employees);
   }
 
   // Letter methods
   async getLetter(id: string): Promise<Letter | undefined> {
-    return this.letters.get(id);
+    const result = await this.db.select().from(letters).where(eq(letters.id, id));
+    return result[0];
   }
 
   async getLettersByUser(userId: string): Promise<Letter[]> {
-    return Array.from(this.letters.values()).filter(letter => letter.userId === userId);
+    return await this.db.select().from(letters).where(eq(letters.userId, userId));
   }
 
   async getAllLetters(): Promise<Letter[]> {
-    return Array.from(this.letters.values());
+    return await this.db.select().from(letters);
   }
 
   async createLetter(insertLetter: InsertLetter): Promise<Letter> {
-    const id = randomUUID();
-    const letter: Letter = {
+    const result = await this.db.insert(letters).values({
       ...insertLetter,
-      id,
-      status: 'requested',
-      createdAt: new Date(),
-      aiGeneratedAt: null,
-      reviewedAt: null,
-      completedAt: null,
-      downloadedAt: null
-    };
-    this.letters.set(id, letter);
-    return letter;
+      status: 'requested'
+    }).returning();
+    return result[0];
   }
 
   async updateLetter(id: string, updates: Partial<Letter>): Promise<Letter> {
-    const letter = this.letters.get(id);
-    if (!letter) throw new Error('Letter not found');
+    const result = await this.db.update(letters)
+      .set(updates)
+      .where(eq(letters.id, id))
+      .returning();
     
-    const updatedLetter = { ...letter, ...updates };
-    this.letters.set(id, updatedLetter);
-    return updatedLetter;
+    if (result.length === 0) {
+      throw new Error('Letter not found');
+    }
+    return result[0];
   }
 
   // Subscription methods
   async getSubscriptionPlans(): Promise<SubscriptionPlan[]> {
-    return Array.from(this.subscriptionPlans.values());
+    return await this.db.select().from(subscriptionPlans);
   }
 
   async getActiveSubscriptionPlans(): Promise<SubscriptionPlan[]> {
-    return Array.from(this.subscriptionPlans.values()).filter(plan => plan.isActive);
+    return await this.db.select().from(subscriptionPlans).where(eq(subscriptionPlans.isActive, true));
   }
 
   async getUserSubscription(userId: string): Promise<UserSubscription | undefined> {
-    return Array.from(this.userSubscriptions.values()).find(sub => sub.userId === userId && sub.status === 'active');
+    const result = await this.db.select().from(userSubscriptions)
+      .where(and(
+        eq(userSubscriptions.userId, userId),
+        eq(userSubscriptions.status, 'active')
+      ));
+    return result[0];
   }
 
   async createUserSubscription(insertSubscription: InsertUserSubscription): Promise<UserSubscription> {
-    const id = randomUUID();
-    const subscription: UserSubscription = {
+    const result = await this.db.insert(userSubscriptions).values({
       ...insertSubscription,
-      id,
-      createdAt: new Date(),
       cancelledAt: null
-    };
-    this.userSubscriptions.set(id, subscription);
-    return subscription;
+    }).returning();
+    return result[0];
   }
 
   async updateUserSubscription(id: string, updates: Partial<UserSubscription>): Promise<UserSubscription> {
-    const subscription = this.userSubscriptions.get(id);
-    if (!subscription) throw new Error('Subscription not found');
+    const result = await this.db.update(userSubscriptions)
+      .set(updates)
+      .where(eq(userSubscriptions.id, id))
+      .returning();
     
-    const updatedSubscription = { ...subscription, ...updates };
-    this.userSubscriptions.set(id, updatedSubscription);
-    return updatedSubscription;
+    if (result.length === 0) {
+      throw new Error('Subscription not found');
+    }
+    return result[0];
   }
 
   // Commission methods
   async getCommissionsByEmployee(employeeId: string): Promise<CommissionRecord[]> {
-    return Array.from(this.commissionRecords.values()).filter(record => record.employeeId === employeeId);
+    return await this.db.select().from(commissionRecords).where(eq(commissionRecords.employeeId, employeeId));
   }
 
   async createCommissionRecord(record: Omit<CommissionRecord, 'id' | 'createdAt'>): Promise<CommissionRecord> {
-    const id = randomUUID();
-    const commissionRecord: CommissionRecord = {
-      ...record,
-      id,
-      createdAt: new Date()
-    };
-    this.commissionRecords.set(id, commissionRecord);
-    return commissionRecord;
+    const result = await this.db.insert(commissionRecords).values(record).returning();
+    return result[0];
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
