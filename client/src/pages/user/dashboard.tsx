@@ -1,11 +1,15 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Sidebar } from '@/components/layout/sidebar';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
 import { useAuth } from '@/hooks/use-auth';
 import { formatDate } from '@/lib/utils';
+import { useToast } from '@/hooks/use-toast';
 
 export default function UserDashboard() {
   const { user } = useAuth();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
 
   const { data: subscription } = useQuery({
     queryKey: ['/api/user/subscription']
@@ -14,6 +18,65 @@ export default function UserDashboard() {
   const { data: letters = [] } = useQuery({
     queryKey: ['/api/letters']
   });
+
+  // Download mutation for handling PDF downloads
+  const downloadMutation = useMutation({
+    mutationFn: async (letterId: string) => {
+      const response = await fetch(`/api/letters/${letterId}/download`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Download failed' }));
+        throw new Error(errorData.error || 'Download failed');
+      }
+
+      // Get the filename from the Content-Disposition header
+      const contentDisposition = response.headers.get('content-disposition');
+      let filename = 'legal_letter.pdf';
+      if (contentDisposition) {
+        const match = contentDisposition.match(/filename="?([^"]+)"?/);
+        if (match) {
+          filename = match[1];
+        }
+      }
+
+      // Create blob and download
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+
+      return letterId;
+    },
+    onSuccess: (letterId) => {
+      // Invalidate letters query to refresh the status
+      queryClient.invalidateQueries({ queryKey: ['/api/letters'] });
+      toast({
+        title: "Success",
+        description: "Letter downloaded successfully",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to download letter",
+        variant: "destructive",
+      });
+    }
+  });
+
+  const handleDownload = (letterId: string) => {
+    downloadMutation.mutate(letterId);
+  };
 
   const sidebarLinks = [
     { href: '/dashboard', label: 'Dashboard', icon: 'fas fa-tachometer-alt' },
@@ -25,7 +88,7 @@ export default function UserDashboard() {
   const stats = {
     total: letters.length,
     pending: letters.filter((l: any) => l.status === 'requested' || l.status === 'reviewing').length,
-    completed: letters.filter((l: any) => l.status === 'completed').length,
+    completed: letters.filter((l: any) => l.status === 'completed' || l.status === 'downloaded').length,
     remaining: subscription?.lettersRemaining || 0
   };
 
@@ -141,8 +204,19 @@ export default function UserDashboard() {
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-muted-foreground">{formatDate(letter.createdAt)}</td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                            {letter.status === 'completed' ? (
-                              <a href="#" className="text-primary hover:text-primary/80" data-testid={`link-download-${letter.id}`}>Download</a>
+                            {(letter.status === 'completed' || letter.status === 'downloaded') && letter.pdfUrl ? (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => handleDownload(letter.id)}
+                                disabled={downloadMutation.isPending}
+                                data-testid={`button-download-${letter.id}`}
+                              >
+                                {downloadMutation.isPending ? 'Downloading...' : 
+                                 letter.status === 'downloaded' ? 'Download Again' : 'Download PDF'}
+                              </Button>
+                            ) : letter.status === 'completed' ? (
+                              <span className="text-yellow-600 text-sm">PDF Processing...</span>
                             ) : (
                               <span className="text-muted-foreground">Pending</span>
                             )}
