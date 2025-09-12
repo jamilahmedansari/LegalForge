@@ -3,35 +3,13 @@ import { Sidebar } from '@/components/layout/sidebar';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
 import { formatDate } from '@/lib/utils';
+import type { User, UserSubscription } from '@shared/schema';
 
-// Mock user data for display since we don't have a getAllUsers endpoint
-const mockUsers = [
-  {
-    id: '1',
-    fullName: 'John Doe',
-    email: 'john.doe@email.com',
-    userType: 'user',
-    createdAt: new Date().toISOString(),
-    subscription: {
-      plan: 'Monthly Plan',
-      lettersUsed: 12,
-      lettersRemaining: 36
-    }
-  },
-  {
-    id: '2', 
-    fullName: 'Sarah Johnson',
-    email: 'sarah.j@email.com',
-    userType: 'user',
-    createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
-    subscription: {
-      plan: 'Premium Plan',
-      lettersUsed: 23,
-      lettersRemaining: 73
-    }
-  }
-];
+type UserWithSubscription = User & {
+  subscription?: UserSubscription;
+};
 
 export default function AdminUsers() {
   const sidebarLinks = [
@@ -41,8 +19,27 @@ export default function AdminUsers() {
     { href: '/admin/employees', label: 'Employees', icon: 'fas fa-user-tie' }
   ];
 
-  // In a real implementation, this would fetch from /api/admin/users
-  const users = mockUsers;
+  const { data: users = [], isLoading, error } = useQuery<UserWithSubscription[]>({
+    queryKey: ['/api/admin/users']
+  });
+
+  if (error) {
+    return (
+      <div className="flex h-screen bg-background" data-testid="admin-users-page">
+        <Sidebar
+          title="Admin Portal"
+          icon="fas fa-user-shield"
+          links={sidebarLinks}
+        />
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-center">
+            <p className="text-destructive mb-4">Error loading users</p>
+            <Button onClick={() => window.location.reload()}>Retry</Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-background" data-testid="admin-users-page">
@@ -67,7 +64,19 @@ export default function AdminUsers() {
               </Button>
             </CardHeader>
             <CardContent>
-              {users.length === 0 ? (
+              {isLoading ? (
+                <div className="space-y-4">
+                  {[...Array(5)].map((_, i) => (
+                    <div key={i} className="flex items-center space-x-4 p-4">
+                      <Skeleton className="h-8 w-8 rounded-full" />
+                      <div className="space-y-2">
+                        <Skeleton className="h-4 w-[200px]" />
+                        <Skeleton className="h-4 w-[160px]" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : users.length === 0 ? (
                 <div className="text-center py-8">
                   <p className="text-muted-foreground" data-testid="text-no-users">No users found</p>
                 </div>
@@ -102,8 +111,8 @@ export default function AdminUsers() {
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap">
                             {user.subscription ? (
-                              <Badge variant={user.subscription.plan.includes('Premium') ? 'default' : 'secondary'}>
-                                {user.subscription.plan}
+                              <Badge variant={user.subscription.lettersRemaining > 50 ? 'default' : 'secondary'}>
+                                Active Plan
                               </Badge>
                             ) : (
                               <span className="text-muted-foreground">No subscription</span>
@@ -111,7 +120,7 @@ export default function AdminUsers() {
                           </td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm text-foreground">
                             {user.subscription ? 
-                              `${user.subscription.lettersUsed} / ${user.subscription.lettersUsed + user.subscription.lettersRemaining}` : 
+                              `${user.subscription.lettersUsed || 0} / ${(user.subscription.lettersUsed || 0) + (user.subscription.lettersRemaining || 0)}` : 
                               '0 / 0'
                             }
                           </td>
