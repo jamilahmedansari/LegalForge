@@ -6,6 +6,9 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import Stripe from "stripe";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { PDFService } from "./pdf-service";
+import path from "path";
+import fs from "fs";
 
 // Environment validation
 if (!process.env.SESSION_SECRET) {
@@ -380,6 +383,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(403).json({ error: "Access denied" });
       }
 
+      // Check if letter is being marked as completed and generate PDF
+      if (req.body.status === 'completed' && letter.status !== 'completed') {
+        try {
+          console.log(`Generating PDF for letter ${letter.id}...`);
+          
+          // Build effective letter with updates merged BEFORE PDF generation
+          // This ensures PDF uses the latest content including finalContent
+          const effectiveLetter = { ...letter, ...req.body };
+          
+          // Generate PDF from updated letter data
+          const pdfUrl = await PDFService.generatePDF(effectiveLetter);
+          
+          // Update letter with PDF URL and completion timestamp
+          req.body.pdfUrl = pdfUrl;
+          req.body.completedAt = new Date().toISOString();
+          
+          console.log(`PDF generated successfully for letter ${letter.id}: ${pdfUrl}`);
+        } catch (pdfError: any) {
+          console.error(`Failed to generate PDF for letter ${letter.id}:`, pdfError);
+          // Continue with status update even if PDF generation fails
+          // This prevents the completion from being blocked by PDF issues
+        }
+      }
+
       const updatedLetter = await storage.updateLetter(req.params.id, req.body);
       res.json(updatedLetter);
     } catch (error: any) {
@@ -429,6 +456,67 @@ export async function registerRoutes(app: Express): Promise<Server> {
         topEmployees: employees.sort((a, b) => parseFloat(b.totalCommission) - parseFloat(a.totalCommission)).slice(0, 5)
       });
     } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // PDF file serving route
+  app.get("/api/pdfs/:filename", authenticateToken, async (req: any, res) => {
+    try {
+      const filename = req.params.filename;
+      
+      // Validate filename to prevent path traversal attacks
+      if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+        return res.status(400).json({ error: "Invalid filename" });
+      }
+
+      // Ensure only PDF files can be accessed
+      if (!filename.endsWith('.pdf')) {
+        return res.status(400).json({ error: "Only PDF files are allowed" });
+      }
+
+      // Security: Require filename to start with "letter-" to prevent arbitrary file access
+      if (!filename.startsWith('letter-')) {
+        return res.status(400).json({ error: "Invalid filename format - must be a letter PDF" });
+      }
+
+      // Get the PDF file path
+      const filePath = await PDFService.getPDFPath(filename);
+      
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: "PDF file not found" });
+      }
+
+      // For additional security, verify the user has access to the letter
+      // Extract letter ID from filename (format: letter-{id}-{timestamp}.pdf)
+      const letterIdMatch = filename.match(/^letter-([a-f0-9-]+)-/);
+      if (!letterIdMatch) {
+        return res.status(400).json({ error: "Invalid letter filename format" });
+      }
+
+      const letterId = letterIdMatch[1];
+      const letter = await storage.getLetter(letterId);
+      
+      if (!letter) {
+        return res.status(404).json({ error: "Letter not found" });
+      }
+
+      // Check permissions - only letter owner or admin can access
+      if (req.user.userType !== 'admin' && letter.userId !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Set appropriate headers for PDF download
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'no-cache');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(filePath);
+      fileStream.pipe(res);
+    } catch (error: any) {
+      console.error('Error serving PDF:', error);
       res.status(500).json({ error: error.message });
     }
   });
