@@ -444,7 +444,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(403).json({ error: "Access denied" });
       }
 
-      const users = await storage.getAllUsers?.() || [];
+      const users = await storage.getAllUsers();
       const letters = await storage.getAllLetters();
       const employees = await storage.getAllEmployees();
 
@@ -455,6 +455,58 @@ export async function registerRoutes(app: Express): Promise<Server> {
         recentLetters: letters.slice(-10).reverse(),
         topEmployees: employees.sort((a, b) => parseFloat(b.totalCommission) - parseFloat(a.totalCommission)).slice(0, 5)
       });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Admin users endpoint
+  app.get("/api/admin/users", authenticateToken, async (req: any, res) => {
+    try {
+      if (req.user.userType !== 'admin') {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      const users = await storage.getAllUsers();
+      
+      // Get subscription info for each user
+      const usersWithSubscriptions = await Promise.all(
+        users.map(async (user) => {
+          const subscription = await storage.getUserSubscription(user.id);
+          return {
+            ...user,
+            subscription
+          };
+        })
+      );
+
+      res.json(usersWithSubscriptions);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Admin employees endpoint
+  app.get("/api/admin/employees", authenticateToken, async (req: any, res) => {
+    try {
+      if (req.user.userType !== 'admin') {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      const employees = await storage.getAllEmployees();
+      
+      // Get user data for each employee to include full name
+      const employeesWithUserData = await Promise.all(
+        employees.map(async (employee) => {
+          const user = await storage.getUser(employee.id);
+          return {
+            ...employee,
+            fullName: user?.fullName || 'Unknown'
+          };
+        })
+      );
+
+      res.json(employeesWithUserData);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
