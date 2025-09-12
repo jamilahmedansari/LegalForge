@@ -36,6 +36,58 @@ export default function AdminLetters() {
     }
   });
 
+  // Download mutation for admin PDF downloads (using secured admin endpoint)
+  const downloadMutation = useMutation({
+    mutationFn: async (letter: any) => {
+      if (!letter.pdfUrl) {
+        throw new Error('PDF not available for this letter');
+      }
+
+      // Use the secured admin download endpoint instead of direct pdfUrl access
+      const response = await fetch(`/api/admin/letters/${letter.id}/download`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('token')}`,
+        },
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Download failed' }));
+        throw new Error(errorData.error || 'Download failed');
+      }
+
+      // Create blob and download
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Legal_Letter_${letter.subject.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+
+      return letter.id;
+    },
+    onSuccess: () => {
+      toast({
+        title: "Success",
+        description: "Letter downloaded successfully",
+      });
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.message || "Failed to download letter",
+        variant: "destructive",
+      });
+    }
+  });
+
+  const handleDownload = (letter: any) => {
+    downloadMutation.mutate(letter);
+  };
+
   const sidebarLinks = [
     { href: '/admin/dashboard', label: 'Dashboard', icon: 'fas fa-tachometer-alt' },
     { href: '/admin/letters', label: 'All Letters', icon: 'fas fa-file-alt' },
@@ -114,6 +166,13 @@ export default function AdminLetters() {
               >
                 Completed
               </Button>
+              <Button
+                variant={statusFilter === 'downloaded' ? 'default' : 'secondary'}
+                onClick={() => setStatusFilter('downloaded')}
+                data-testid="filter-downloaded"
+              >
+                Downloaded
+              </Button>
             </div>
           </div>
 
@@ -181,6 +240,17 @@ export default function AdminLetters() {
                                 data-testid={`button-complete-${letter.id}`}
                               >
                                 Mark Complete
+                              </Button>
+                            )}
+                            {(letter.status === 'completed' || letter.status === 'downloaded') && letter.pdfUrl && (
+                              <Button
+                                size="sm"
+                                variant="default"
+                                onClick={() => handleDownload(letter)}
+                                disabled={downloadMutation.isPending}
+                                data-testid={`button-download-${letter.id}`}
+                              >
+                                {downloadMutation.isPending ? 'Downloading...' : 'Download PDF'}
                               </Button>
                             )}
                             <Button

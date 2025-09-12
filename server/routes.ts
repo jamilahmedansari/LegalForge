@@ -521,6 +521,117 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // User download endpoint - allows users to download their own letters and marks as downloaded
+  app.get("/api/letters/:id/download", authenticateToken, async (req: any, res) => {
+    try {
+      const letter = await storage.getLetter(req.params.id);
+      if (!letter) {
+        return res.status(404).json({ error: "Letter not found" });
+      }
+
+      // Check permissions - only letter owner can download
+      if (letter.userId !== req.user.id) {
+        return res.status(403).json({ error: "Access denied" });
+      }
+
+      // Check if letter is completed and has a PDF
+      if (letter.status !== 'completed' && letter.status !== 'downloaded') {
+        return res.status(400).json({ error: "Letter is not ready for download" });
+      }
+
+      if (!letter.pdfUrl) {
+        return res.status(400).json({ error: "PDF not available for this letter" });
+      }
+
+      // Extract filename from pdfUrl (format: /api/pdfs/letter-{id}-{timestamp}.pdf)
+      const filename = letter.pdfUrl.split('/').pop();
+      if (!filename) {
+        return res.status(400).json({ error: "Invalid PDF URL" });
+      }
+
+      // Get the PDF file path
+      const filePath = await PDFService.getPDFPath(filename);
+      
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: "PDF file not found on server" });
+      }
+
+      // Update letter status to 'downloaded' if it's not already
+      if (letter.status === 'completed') {
+        await storage.updateLetter(req.params.id, {
+          status: 'downloaded',
+          downloadedAt: new Date().toISOString()
+        });
+      }
+
+      // Set appropriate headers for PDF download
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="Legal_Letter_${letter.subject.replace(/[^a-zA-Z0-9]/g, '_')}.pdf"`);
+      res.setHeader('Cache-Control', 'no-cache');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(filePath);
+      fileStream.pipe(res);
+    } catch (error: any) {
+      console.error('Error downloading letter:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Admin download endpoint - allows admins to download any letter without status updates
+  app.get("/api/admin/letters/:id/download", authenticateToken, async (req: any, res) => {
+    try {
+      // Check admin permissions first
+      if (req.user.userType !== 'admin') {
+        return res.status(403).json({ error: "Access denied - admin privileges required" });
+      }
+
+      const letter = await storage.getLetter(req.params.id);
+      if (!letter) {
+        return res.status(404).json({ error: "Letter not found" });
+      }
+
+      // Check if letter is completed and has a PDF
+      if (letter.status !== 'completed' && letter.status !== 'downloaded') {
+        return res.status(400).json({ error: "Letter is not ready for download" });
+      }
+
+      if (!letter.pdfUrl) {
+        return res.status(400).json({ error: "PDF not available for this letter" });
+      }
+
+      // Extract filename from pdfUrl (format: /api/pdfs/letter-{id}-{timestamp}.pdf)
+      const filename = letter.pdfUrl.split('/').pop();
+      if (!filename) {
+        return res.status(400).json({ error: "Invalid PDF URL" });
+      }
+
+      // Get the PDF file path
+      const filePath = await PDFService.getPDFPath(filename);
+      
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: "PDF file not found on server" });
+      }
+
+      // Note: Admin downloads do NOT update letter status 
+      // This preserves the original status for user tracking
+
+      // Set appropriate headers for PDF download
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="Legal_Letter_${letter.subject.replace(/[^a-zA-Z0-9]/g, '_')}.pdf"`);
+      res.setHeader('Cache-Control', 'no-cache');
+      
+      // Stream the file
+      const fileStream = fs.createReadStream(filePath);
+      fileStream.pipe(res);
+    } catch (error: any) {
+      console.error('Error downloading letter as admin:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // AI letter generation helper function
   async function generateLetterContent(letterId: string, subscriptionId: string, lettersRemaining: number, lettersUsed: number) {
     try {
