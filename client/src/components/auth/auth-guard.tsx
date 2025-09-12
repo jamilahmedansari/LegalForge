@@ -1,4 +1,4 @@
-import { Navigate, useLocation } from 'wouter';
+import { Redirect, useLocation } from 'wouter';
 import { useAuth } from '@/hooks/use-auth';
 
 interface AuthGuardProps {
@@ -19,11 +19,11 @@ export function AuthGuard({ children, allowedRoles }: AuthGuardProps) {
   }
 
   if (!user) {
-    return <Navigate to="/login" />;
+    return <Redirect to="/login" />;
   }
 
   if (allowedRoles && !allowedRoles.includes(user.userType)) {
-    return <Navigate to="/" />;
+    return <Redirect to="/" />;
   }
 
   return <>{children}</>;
