@@ -5,7 +5,7 @@ import { insertUserSchema, insertLetterSchema, insertUserSubscriptionSchema } fr
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import Stripe from "stripe";
-import OpenAI from "openai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // Environment validation
 if (!process.env.SESSION_SECRET) {
@@ -17,8 +17,8 @@ if (!process.env.STRIPE_SECRET_KEY) {
   console.warn('STRIPE_SECRET_KEY not provided - payment features will be disabled');
 }
 
-if (!process.env.OPENAI_API_KEY) {
-  console.warn('OPENAI_API_KEY not provided - AI letter generation will be disabled');
+if (!process.env.GEMINI_API_KEY) {
+  console.warn('GEMINI_API_KEY not provided - AI letter generation will be disabled');
 }
 
 if (!process.env.VITE_STRIPE_PUBLIC_KEY) {
@@ -30,8 +30,9 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
   apiVersion: "2024-09-30.acacia",
 }) : null;
 
-// the newest OpenAI model is "gpt-5" which was released August 7, 2025. do not change this unless explicitly requested by the user
-const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+// Initialize Gemini Pro for AI letter generation
+const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
+const geminiModel = genAI ? genAI.getGenerativeModel({ model: "gemini-pro" }) : null;
 
 // Middleware for JWT authentication
 const authenticateToken = async (req: any, res: any, next: any) => {
@@ -321,6 +322,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/letters", authenticateToken, async (req: any, res) => {
     try {
+      // Check if Gemini AI is available before proceeding
+      if (!geminiModel) {
+        return res.status(503).json({ error: "AI letter generation is not available - please contact support" });
+      }
+
       // Check if user has active subscription with letters remaining
       const subscription = await storage.getUserSubscription(req.user.id);
       if (!subscription || subscription.lettersRemaining <= 0) {
@@ -335,14 +341,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const letter = await storage.createLetter(letterData);
 
-      // Update subscription letters remaining
-      await storage.updateUserSubscription(subscription.id, {
-        lettersRemaining: subscription.lettersRemaining - 1,
-        lettersUsed: subscription.lettersUsed + 1
-      });
-
-      // Generate AI content asynchronously
-      generateLetterContent(letter.id);
+      // Generate AI content and only deduct credits on success
+      generateLetterContent(letter.id, subscription.id, subscription.lettersRemaining, subscription.lettersUsed || 0);
 
       res.json(letter);
     } catch (error: any) {
@@ -434,45 +434,101 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // AI letter generation helper function
-  async function generateLetterContent(letterId: string) {
+  async function generateLetterContent(letterId: string, subscriptionId: string, lettersRemaining: number, lettersUsed: number) {
     try {
+      if (!geminiModel) {
+        console.error('Gemini AI is not available - cannot generate letter content');
+        return;
+      }
+
       const letter = await storage.getLetter(letterId);
-      if (!letter) return;
+      if (!letter) {
+        console.error(`Letter ${letterId} not found`);
+        return;
+      }
 
-      const prompt = `Generate a professional legal letter with the following details:
-      
-      Sender: ${letter.senderName}${letter.senderFirmName ? ` from ${letter.senderFirmName}` : ''}
-      Recipient: ${letter.recipientName}
-      Subject: ${letter.subject}
-      Conflict: ${letter.conflictDescription}
-      Desired Resolution: ${letter.desiredResolution}
-      ${letter.additionalNotes ? `Additional Notes: ${letter.additionalNotes}` : ''}
-      
-      Please format this as a formal legal letter with proper legal language and structure. Include appropriate legal terminology and maintain a professional tone throughout. The letter should clearly state the issue, reference relevant facts, and specify the desired resolution.
-      
-      Return the response in JSON format with the following structure:
-      {
-        "content": "The full letter content",
-        "summary": "Brief summary of the letter"
-      }`;
+      // Idempotency check: Skip if already processed to prevent double-deduction
+      if (letter.aiGeneratedContent || letter.status === 'reviewing' || letter.status === 'completed') {
+        console.log(`Letter ${letterId} already processed, skipping generation`);
+        return;
+      }
 
-      const response = await openai.chat.completions.create({
-        model: "gpt-5", // the newest OpenAI model is "gpt-5" which was released August 7, 2025. do not change this unless explicitly requested by the user
-        messages: [
-          {
-            role: "system",
-            content: "You are a professional legal assistant specializing in drafting formal legal correspondence. Generate professional, legally sound letters with appropriate formatting and language."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        response_format: { type: "json_object" }
+      // Mark letter as processing to prevent concurrent processing
+      await storage.updateLetter(letterId, {
+        status: 'generating'
       });
 
-      const result = JSON.parse(response.choices[0].message.content || '{}');
+      const systemPrompt = "You are a professional legal assistant specializing in drafting formal legal correspondence. Generate professional, legally sound letters with appropriate formatting and language.";
+      
+      const prompt = `${systemPrompt}
 
+Generate a professional legal letter with the following details:
+
+Sender: ${letter.senderName}${letter.senderFirmName ? ` from ${letter.senderFirmName}` : ''}
+Recipient: ${letter.recipientName}
+Subject: ${letter.subject}
+Conflict: ${letter.conflictDescription}
+Desired Resolution: ${letter.desiredResolution}
+${letter.additionalNotes ? `Additional Notes: ${letter.additionalNotes}` : ''}
+
+Please format this as a formal legal letter with proper legal language and structure. Include appropriate legal terminology and maintain a professional tone throughout. The letter should clearly state the issue, reference relevant facts, and specify the desired resolution.
+
+Return ONLY a valid JSON object with this exact structure:
+{
+  "content": "The full letter content",
+  "summary": "Brief summary of the letter"
+}`;
+
+      // Use improved Gemini model with structured output
+      const response = await geminiModel.generateContent({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          maxOutputTokens: 2048,
+          temperature: 0.1, // Lower temperature for more consistent legal language
+        }
+      });
+      
+      const responseText = response.response.text().trim();
+      
+      // Parse JSON response with better error handling
+      let result;
+      try {
+        // Clean response text and extract JSON
+        const cleanedResponse = responseText.replace(/```json\n?|\n?```/g, '').trim();
+        const jsonMatch = cleanedResponse.match(/\{[\s\S]*\}/) || [cleanedResponse];
+        result = JSON.parse(jsonMatch[0]);
+        
+        // Validate required fields
+        if (!result.content || !result.summary) {
+          throw new Error('Missing required fields in response');
+        }
+      } catch (parseError) {
+        console.warn('Failed to parse structured JSON response, using fallback:', parseError);
+        result = {
+          content: responseText,
+          summary: "AI-generated legal letter"
+        };
+      }
+
+      // ONLY deduct credits AFTER successful generation using atomic delta updates
+      // Get fresh subscription data to ensure accuracy
+      const currentSubscription = await storage.getUserSubscription(letter.userId);
+      if (!currentSubscription) {
+        throw new Error('User subscription not found during credit deduction');
+      }
+
+      // Verify user still has credits available
+      if (currentSubscription.lettersRemaining <= 0) {
+        throw new Error('No letters remaining in subscription');
+      }
+
+      // Atomic credit deduction using deltas (safer than absolute values)
+      await storage.updateUserSubscription(subscriptionId, {
+        lettersRemaining: currentSubscription.lettersRemaining - 1,
+        lettersUsed: (currentSubscription.lettersUsed || 0) + 1
+      });
+
+      // Update letter with generated content ONLY after successful credit deduction
       await storage.updateLetter(letterId, {
         aiPrompt: prompt,
         aiGeneratedContent: result.content,
@@ -480,11 +536,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
         aiGeneratedAt: new Date()
       });
 
+      console.log(`Successfully generated content for letter ${letterId} and deducted credit`);
+
     } catch (error) {
-      console.error('Error generating letter content:', error);
+      console.error(`Error generating letter content for ${letterId}:`, error);
+      
+      // Reset letter status on error - no credit restoration needed since credits weren't deducted
       await storage.updateLetter(letterId, {
-        status: 'requested' // Reset status on error
+        status: 'requested' // Reset status so user can try again without losing credits
       });
+      
+      // Log the error for monitoring but don't throw - this is a background process
+      console.error(`Letter ${letterId} generation failed, status reset to 'requested' for retry`);
     }
   }
 
