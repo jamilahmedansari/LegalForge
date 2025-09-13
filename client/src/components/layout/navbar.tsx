@@ -22,7 +22,7 @@ export function Navbar() {
               </div>
             </Link>
           </div>
-          
+
           <nav className="hidden md:flex space-x-8">
             <Link href="/" data-testid="link-home-nav">
               <a className={`text-muted-foreground hover:text-foreground px-3 py-2 text-sm font-medium ${location === '/' ? 'text-foreground' : ''}`}>
@@ -37,16 +37,12 @@ export function Navbar() {
           </nav>
 
           <div className="flex items-center space-x-4">
-            <Link href="/login" data-testid="link-login">
-              <Button variant="ghost" size="sm">
+            <Link href="/login" className="text-sm font-medium text-muted-foreground hover:text-foreground">
                 Sign In
-              </Button>
-            </Link>
-            <Link href="/signup" data-testid="link-signup">
-              <Button size="sm" data-testid="button-get-started">
-                Get Started
-              </Button>
-            </Link>
+              </Link>
+              <Link href="/signup">
+                <Button>Get Started</Button>
+              </Link>
           </div>
         </div>
       </div>

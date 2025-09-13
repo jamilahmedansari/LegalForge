@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useAuth } from '@/hooks/use-auth';
 import { useLocation } from 'wouter';
 import { Button } from '@/components/ui/button';
@@ -24,14 +24,19 @@ export default function Signup() {
   const { toast } = useToast();
 
   // Redirect if already logged in
-  if (user) {
-    if (user.userType === 'admin') {
-      setLocation('/admin/dashboard');
-    } else if (user.userType === 'employee') {
-      setLocation('/employee/dashboard');
-    } else {
-      setLocation('/dashboard');
+  useEffect(() => {
+    if (user) {
+      if (user.userType === 'admin') {
+        setLocation('/admin/dashboard');
+      } else if (user.userType === 'employee') {
+        setLocation('/employee/dashboard');
+      } else {
+        setLocation('/dashboard');
+      }
     }
+  }, [user, setLocation]);
+
+  if (user) {
     return null;
   }
 
