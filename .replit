@@ -37,6 +37,15 @@ task = "shell.exec"
 args = "npm run dev"
 waitForPort = 5000
 
+[[workflows.workflow]]
+name = "Nh"
+mode = "parallel"
+author = 47497693
+
+[[workflows.workflow.tasks]]
+task = "packager.installForLanguage"
+args = "nix"
+
 [[ports]]
 localPort = 5000
 externalPort = 80
